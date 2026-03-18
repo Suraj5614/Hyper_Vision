@@ -1,0 +1,505 @@
+# ============================================================
+# MEDICORE HOSPITAL — STREAMLIT IN SNOWFLAKE DASHBOARD
+# Deploy this file inside Snowflake → Streamlit
+# ============================================================
+
+import streamlit as st
+from snowflake.snowpark.context import get_active_session
+import pandas as pd
+
+# ── Page config ──────────────────────────────────────────────
+st.set_page_config(
+    page_title="MediCore Operations Dashboard",
+    page_icon="🏥",
+    layout="wide",
+)
+
+# ── Custom CSS ───────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=DM+Sans:wght@300;400;500;600&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'DM Sans', sans-serif;
+    background-color: #0d1117;
+    color: #e6edf3;
+}
+
+.medicore-header {
+    background: linear-gradient(135deg, #1a2332 0%, #0d1117 60%, #1a2332 100%);
+    border: 1px solid #21262d;
+    border-radius: 12px;
+    padding: 28px 36px;
+    margin-bottom: 28px;
+}
+.medicore-header h1 {
+    font-family: 'DM Serif Display', serif;
+    font-size: 2rem;
+    margin: 0;
+    background: linear-gradient(90deg, #58a6ff, #79c0ff);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+.medicore-header p {
+    margin: 4px 0 0;
+    color: #8b949e;
+    font-size: 0.85rem;
+}
+
+.kpi-card {
+    background: #161b22;
+    border: 1px solid #21262d;
+    border-radius: 10px;
+    padding: 22px 24px;
+    position: relative;
+    overflow: hidden;
+}
+.kpi-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 3px;
+    border-radius: 10px 10px 0 0;
+}
+.kpi-card.blue::before   { background: linear-gradient(90deg,#1f6feb,#58a6ff); }
+.kpi-card.green::before  { background: linear-gradient(90deg,#2ea043,#3fb950); }
+.kpi-card.orange::before { background: linear-gradient(90deg,#d29922,#e3b341); }
+.kpi-card.red::before    { background: linear-gradient(90deg,#da3633,#f85149); }
+.kpi-card.purple::before { background: linear-gradient(90deg,#8957e5,#a371f7); }
+
+.kpi-label {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #8b949e;
+    font-weight: 600;
+    margin-bottom: 8px;
+}
+.kpi-value {
+    font-family: 'DM Serif Display', serif;
+    font-size: 2.2rem;
+    color: #e6edf3;
+    line-height: 1;
+    margin-bottom: 4px;
+}
+.kpi-sub { font-size: 0.78rem; color: #6e7681; }
+
+.section-title {
+    font-family: 'DM Serif Display', serif;
+    font-size: 1.2rem;
+    color: #c9d1d9;
+    border-bottom: 1px solid #21262d;
+    padding-bottom: 10px;
+    margin: 32px 0 16px;
+}
+
+.badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    margin-right: 6px;
+}
+.badge-red    { background: #3d1a1a; color: #f85149; }
+.badge-orange { background: #2d2208; color: #e3b341; }
+.badge-blue   { background: #0d1f38; color: #58a6ff; }
+.badge-purple { background: #1f1130; color: #a371f7; }
+.badge-green  { background: #0d2318; color: #3fb950; }
+</style>
+""", unsafe_allow_html=True)
+
+# ── Snowflake session ─────────────────────────────────────────
+session = get_active_session()
+
+@st.cache_data(ttl=300)
+def run_query(sql: str) -> pd.DataFrame:
+    return session.sql(sql).to_pandas()
+
+# ── HEADER ───────────────────────────────────────────────────
+st.markdown("""
+<div class="medicore-header">
+  <h1>🏥 MediCore Operations Dashboard</h1>
+  <p>Real-time hospital intelligence · RAW → VALIDATED → CURATED pipeline</p>
+</div>
+""", unsafe_allow_html=True)
+
+# ── SIDEBAR ───────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### 🔎 Filters")
+
+    dept_df = run_query(
+        "SELECT DISTINCT department FROM MEDICORE_DB.CURATED.FACT_ADMISSIONS ORDER BY 1"
+    )
+    dept_options = ["All Departments"] + dept_df["DEPARTMENT"].tolist()
+    selected_dept = st.selectbox("Department", dept_options)
+
+    st.markdown("---")
+    st.markdown("### 📋 Sections")
+    show_workload = st.checkbox("Doctor Workload",  value=True)
+    show_anomaly  = st.checkbox("Anomaly Log",      value=True)
+    show_dq       = st.checkbox("DQ Failure Log",   value=True)
+    show_raw      = st.checkbox("Layer Row Counts", value=False)
+    show_audit    = st.checkbox("Load Audit Log",   value=True)
+
+    st.markdown("---")
+    if st.button("🔄 Refresh Data"):
+        st.cache_data.clear()
+        st.rerun()
+
+dept_filter = "" if selected_dept == "All Departments" \
+    else f"WHERE department = '{selected_dept}'"
+
+# ── KPI CARDS ────────────────────────────────────────────────
+st.markdown('<div class="section-title">📊 Key Performance Indicators</div>', unsafe_allow_html=True)
+
+kpi_adm = run_query(f"""
+    SELECT
+        SUM(CASE WHEN DATEDIFF(MINUTE,admission_time,discharge_time)=0 THEN 60
+                 ELSE DATEDIFF(MINUTE,admission_time,discharge_time) END)/60.0
+        / NULLIF(COUNT(DISTINCT bed_no),0)                            AS bed_util,
+        AVG(CASE WHEN DATEDIFF(MINUTE,admission_time,discharge_time)=0 THEN 60
+                 ELSE DATEDIFF(MINUTE,admission_time,discharge_time) END)/60.0 AS avg_att,
+        COUNT(*) AS total_admissions
+    FROM MEDICORE_DB.CURATED.FACT_ADMISSIONS {dept_filter}
+""")
+
+kpi_surg = run_query("""
+    SELECT
+        COUNT_IF(ABS(DATEDIFF(MINUTE,scheduled_time,start_time))<=10)
+        / NULLIF(COUNT(*),0) * 100 AS surg_eff,
+        COUNT(*) AS total_procs
+    FROM MEDICORE_DB.CURATED.FACT_PROCEDURES
+""")
+
+kpi_bill = run_query("""
+    SELECT
+        1 - (
+            (SELECT COUNT(*) FROM MEDICORE_DB.VALIDATED.ANOMALY_LOG
+             WHERE anomaly_type IN ('HIGH_BILLING','DUPLICATE_BILL_TIME'))
+            / NULLIF((SELECT COUNT(*) FROM MEDICORE_DB.CURATED.FACT_BILLING),0)
+        ) AS bill_acc,
+        SUM(total_amount) AS total_revenue
+    FROM MEDICORE_DB.CURATED.FACT_BILLING
+""")
+
+anomaly_count = int(run_query(
+    "SELECT COUNT(*) AS cnt FROM MEDICORE_DB.VALIDATED.ANOMALY_LOG"
+)["CNT"].iloc[0] or 0)
+
+bed_util   = round(float(kpi_adm["BED_UTIL"].iloc[0]   or 0), 1)
+avg_att    = round(float(kpi_adm["AVG_ATT"].iloc[0]    or 0), 1)
+total_adm  = int(kpi_adm["TOTAL_ADMISSIONS"].iloc[0]   or 0)
+surg_eff   = round(float(kpi_surg["SURG_EFF"].iloc[0]  or 0), 1)
+total_proc = int(kpi_surg["TOTAL_PROCS"].iloc[0]       or 0)
+bill_acc   = round(float(kpi_bill["BILL_ACC"].iloc[0]  or 0) * 100, 1)
+total_rev  = float(kpi_bill["TOTAL_REVENUE"].iloc[0]   or 0)
+
+c1, c2, c3, c4, c5 = st.columns(5)
+
+with c1:
+    st.markdown(f"""
+    <div class="kpi-card blue">
+      <div class="kpi-label">🛏️ Bed Utilization</div>
+      <div class="kpi-value">{bed_util}<span style="font-size:1rem">h</span></div>
+      <div class="kpi-sub">hours/bed · {total_adm:,} admissions</div>
+    </div>""", unsafe_allow_html=True)
+
+with c2:
+    st.markdown(f"""
+    <div class="kpi-card green">
+      <div class="kpi-label">⏱️ Avg Turnaround (ATT)</div>
+      <div class="kpi-value">{avg_att}<span style="font-size:1rem">h</span></div>
+      <div class="kpi-sub">admission → discharge</div>
+    </div>""", unsafe_allow_html=True)
+
+with c3:
+    st.markdown(f"""
+    <div class="kpi-card orange">
+      <div class="kpi-label">🔪 Surgery Efficiency</div>
+      <div class="kpi-value">{surg_eff}<span style="font-size:1rem">%</span></div>
+      <div class="kpi-sub">on-time · {total_proc:,} procedures</div>
+    </div>""", unsafe_allow_html=True)
+
+with c4:
+    st.markdown(f"""
+    <div class="kpi-card purple">
+      <div class="kpi-label">💰 Billing Accuracy</div>
+      <div class="kpi-value">{bill_acc}<span style="font-size:1rem">%</span></div>
+      <div class="kpi-sub">₹{total_rev:,.0f} revenue</div>
+    </div>""", unsafe_allow_html=True)
+
+with c5:
+    st.markdown(f"""
+    <div class="kpi-card red">
+      <div class="kpi-label">⚠️ Anomalies Flagged</div>
+      <div class="kpi-value">{anomaly_count:,}</div>
+      <div class="kpi-sub">across all rule types</div>
+    </div>""", unsafe_allow_html=True)
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+# ── ADMISSIONS CHARTS ─────────────────────────────────────────
+st.markdown('<div class="section-title">📈 Admissions by Department</div>', unsafe_allow_html=True)
+
+adm_col1, adm_col2 = st.columns([1.5, 1])
+
+with adm_col1:
+    dept_adm = run_query("""
+        SELECT department, COUNT(*) AS admissions
+        FROM MEDICORE_DB.CURATED.FACT_ADMISSIONS
+        GROUP BY department ORDER BY admissions DESC LIMIT 12
+    """)
+    if not dept_adm.empty:
+        st.bar_chart(dept_adm.set_index("DEPARTMENT")["ADMISSIONS"])
+
+with adm_col2:
+    type_adm = run_query("""
+        SELECT admission_type, COUNT(*) AS count,
+               ROUND(AVG(DATEDIFF(HOUR,admission_time,discharge_time)),1) AS avg_hours
+        FROM MEDICORE_DB.CURATED.FACT_ADMISSIONS
+        GROUP BY admission_type
+    """)
+    st.markdown("**By Admission Type**")
+    if not type_adm.empty:
+        st.dataframe(
+            type_adm.rename(columns={
+                "ADMISSION_TYPE":"Type","COUNT":"Count","AVG_HOURS":"Avg Hours"
+            }),
+            use_container_width=True, hide_index=True
+        )
+
+# ── OT ANALYTICS ─────────────────────────────────────────────
+st.markdown('<div class="section-title">🏥 Operation Theatre Analytics</div>', unsafe_allow_html=True)
+
+ot_col1, ot_col2 = st.columns(2)
+
+with ot_col1:
+    ot_room = run_query("""
+        SELECT operating_room,
+               COUNT(*) AS procedures,
+               ROUND(AVG(DATEDIFF(MINUTE,start_time,end_time)),0) AS avg_min
+        FROM MEDICORE_DB.CURATED.FACT_PROCEDURES
+        GROUP BY operating_room ORDER BY procedures DESC
+    """)
+    st.markdown("**Procedures per OT Room**")
+    if not ot_room.empty:
+        st.bar_chart(ot_room.set_index("OPERATING_ROOM")["PROCEDURES"])
+
+with ot_col2:
+    overrun_df = run_query("""
+        SELECT procedure_id, operating_room,
+               DATEDIFF(MINUTE,start_time,end_time) AS duration_min
+        FROM MEDICORE_DB.CURATED.FACT_PROCEDURES
+        WHERE DATEDIFF(MINUTE,start_time,end_time) > 180
+        ORDER BY duration_min DESC LIMIT 10
+    """)
+    st.markdown(f"**OT Overruns (>180 min)** — {len(overrun_df)} cases")
+    if not overrun_df.empty:
+        st.dataframe(
+            overrun_df.rename(columns={
+                "PROCEDURE_ID":"Procedure","OPERATING_ROOM":"OT Room",
+                "DURATION_MIN":"Duration (min)"
+            }),
+            use_container_width=True, hide_index=True
+        )
+    else:
+        st.success("✅ No OT overruns detected")
+
+# ── DOCTOR WORKLOAD ───────────────────────────────────────────
+if show_workload:
+    st.markdown('<div class="section-title">👨‍⚕️ Doctor Workload Index (KPI 4)</div>', unsafe_allow_html=True)
+
+    workload_df = run_query("""
+        SELECT
+            d.doctor_id, d.name, d.specialization, d.department,
+            COUNT(DISTINCT a.admission_id)  AS admissions,
+            COUNT(DISTINCT p.procedure_id)  AS procedures,
+            COUNT(DISTINCT a.admission_id) + COUNT(DISTINCT p.procedure_id) AS total_workload
+        FROM MEDICORE_DB.CURATED.DIM_DOCTORS d
+        LEFT JOIN MEDICORE_DB.CURATED.FACT_ADMISSIONS a ON d.doctor_sk = a.doctor_sk
+        LEFT JOIN MEDICORE_DB.CURATED.FACT_PROCEDURES p ON d.doctor_sk = p.doctor_sk
+        WHERE d.is_current = TRUE
+        GROUP BY d.doctor_id, d.name, d.specialization, d.department
+        ORDER BY total_workload DESC LIMIT 20
+    """)
+
+    if not workload_df.empty:
+        wl1, wl2 = st.columns([1.2, 1])
+        with wl1:
+            st.bar_chart(workload_df.set_index("NAME")["TOTAL_WORKLOAD"])
+        with wl2:
+            st.dataframe(
+                workload_df[["NAME","DEPARTMENT","ADMISSIONS","PROCEDURES","TOTAL_WORKLOAD"]]
+                .rename(columns={
+                    "NAME":"Doctor","DEPARTMENT":"Dept",
+                    "ADMISSIONS":"Adm","PROCEDURES":"Proc","TOTAL_WORKLOAD":"Total"
+                }),
+                use_container_width=True, hide_index=True
+            )
+
+# ── BILLING ANALYTICS ─────────────────────────────────────────
+st.markdown('<div class="section-title">💳 Billing & Claims Analytics</div>', unsafe_allow_html=True)
+
+bill_c1, bill_c2 = st.columns(2)
+
+with bill_c1:
+    pay_df = run_query("""
+        SELECT payment_mode, COUNT(*) AS bills,
+               SUM(total_amount) AS revenue
+        FROM MEDICORE_DB.CURATED.FACT_BILLING
+        GROUP BY payment_mode ORDER BY revenue DESC
+    """)
+    st.markdown("**Revenue by Payment Mode**")
+    if not pay_df.empty:
+        st.bar_chart(pay_df.set_index("PAYMENT_MODE")["REVENUE"])
+
+with bill_c2:
+    flag_df = run_query("""
+        SELECT is_flagged, COUNT(*) AS count,
+               ROUND(SUM(total_amount),2) AS amount
+        FROM MEDICORE_DB.CURATED.FACT_BILLING
+        GROUP BY is_flagged
+    """)
+    st.markdown("**Flagged vs Normal Bills**")
+    if not flag_df.empty:
+        st.dataframe(
+            flag_df.rename(columns={
+                "IS_FLAGGED":"Flagged","COUNT":"Bills","AMOUNT":"Total Amount (₹)"
+            }),
+            use_container_width=True, hide_index=True
+        )
+
+# ── ANOMALY LOG ───────────────────────────────────────────────
+if show_anomaly:
+    st.markdown('<div class="section-title">⚠️ Anomaly Detection Log</div>', unsafe_allow_html=True)
+
+    anomaly_df = run_query("""
+        SELECT anomaly_type, reference_id, description, created_at
+        FROM MEDICORE_DB.VALIDATED.ANOMALY_LOG
+        ORDER BY created_at DESC LIMIT 200
+    """)
+
+    if anomaly_df.empty:
+        st.success("✅ No anomalies detected — all systems clean!")
+    else:
+        summary = anomaly_df["ANOMALY_TYPE"].value_counts()
+        badge_colors = {
+            "BED_CONFLICT":       "badge-red",
+            "PROCEDURE_CLASH":    "badge-orange",
+            "OT_OVERRUN":         "badge-blue",
+            "MULTIPLE_ADMISSIONS":"badge-purple",
+            "HIGH_BILLING":       "badge-red",
+            "DUPLICATE_BILL_TIME":"badge-orange",
+        }
+        badges_html = " ".join([
+            f'<span class="badge {badge_colors.get(t,"badge-green")}">{t}: {c}</span>'
+            for t, c in summary.items()
+        ])
+        st.markdown(badges_html, unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        types = ["All"] + sorted(anomaly_df["ANOMALY_TYPE"].unique().tolist())
+        sel_type = st.selectbox("Filter by anomaly type", types, key="anom_filter")
+        filtered = anomaly_df if sel_type == "All" \
+            else anomaly_df[anomaly_df["ANOMALY_TYPE"] == sel_type]
+
+        st.dataframe(
+            filtered.rename(columns={
+                "ANOMALY_TYPE":"Type","REFERENCE_ID":"Reference",
+                "DESCRIPTION":"Description","CREATED_AT":"Detected At"
+            }),
+            use_container_width=True, hide_index=True
+        )
+
+# ── DQ FAILURE LOG ────────────────────────────────────────────
+if show_dq:
+    st.markdown('<div class="section-title">🔍 Data Quality Failure Log</div>', unsafe_allow_html=True)
+
+    dq_df = run_query("""
+        SELECT issue_type, COUNT(*) AS failures
+        FROM MEDICORE_DB.VALIDATED.DQ_FAILURE_LOG
+        GROUP BY issue_type ORDER BY failures DESC
+    """)
+    dq_detail = run_query("""
+        SELECT table_name, record_id, issue_type, issue_description, created_at
+        FROM MEDICORE_DB.VALIDATED.DQ_FAILURE_LOG
+        ORDER BY created_at DESC LIMIT 50
+    """)
+
+    dq_c1, dq_c2 = st.columns([1, 1.6])
+    with dq_c1:
+        st.markdown("**Failures by Issue Type**")
+        if not dq_df.empty:
+            st.bar_chart(dq_df.set_index("ISSUE_TYPE")["FAILURES"])
+        else:
+            st.success("✅ Zero DQ failures!")
+    with dq_c2:
+        st.markdown("**Recent DQ Records**")
+        if not dq_detail.empty:
+            st.dataframe(
+                dq_detail.rename(columns={
+                    "TABLE_NAME":"Table","RECORD_ID":"Record",
+                    "ISSUE_TYPE":"Issue","ISSUE_DESCRIPTION":"Description",
+                    "CREATED_AT":"Logged At"
+                }),
+                use_container_width=True, hide_index=True
+            )
+        else:
+            st.info("No DQ failures on record.")
+
+# ── LAYER ROW COUNTS ──────────────────────────────────────────
+if show_raw:
+    st.markdown('<div class="section-title">🗄️ Pipeline Layer Record Counts</div>', unsafe_allow_html=True)
+
+    raw_df = run_query("""
+        SELECT 'PATIENTS_RAW'    AS tbl, COUNT(*) AS cnt FROM MEDICORE_DB.RAW.PATIENTS_RAW   UNION ALL
+        SELECT 'DOCTORS_RAW',           COUNT(*)         FROM MEDICORE_DB.RAW.DOCTORS_RAW    UNION ALL
+        SELECT 'ADMISSIONS_RAW',        COUNT(*)         FROM MEDICORE_DB.RAW.ADMISSIONS_RAW UNION ALL
+        SELECT 'PROCEDURES_RAW',        COUNT(*)         FROM MEDICORE_DB.RAW.PROCEDURES_RAW UNION ALL
+        SELECT 'BILLING_RAW',           COUNT(*)         FROM MEDICORE_DB.RAW.BILLING_RAW
+    """)
+    val_df = run_query("""
+        SELECT 'PATIENTS_VALIDATED'    AS tbl, COUNT(*) AS cnt FROM MEDICORE_DB.VALIDATED.PATIENTS_VALIDATED   UNION ALL
+        SELECT 'DOCTORS_VALIDATED',           COUNT(*)         FROM MEDICORE_DB.VALIDATED.DOCTORS_VALIDATED    UNION ALL
+        SELECT 'ADMISSIONS_VALIDATED',        COUNT(*)         FROM MEDICORE_DB.VALIDATED.ADMISSIONS_VALIDATED UNION ALL
+        SELECT 'PROCEDURES_VALIDATED',        COUNT(*)         FROM MEDICORE_DB.VALIDATED.PROCEDURES_VALIDATED UNION ALL
+        SELECT 'BILLING_VALIDATED',           COUNT(*)         FROM MEDICORE_DB.VALIDATED.BILLING_VALIDATED
+    """)
+
+    rc1, rc2 = st.columns(2)
+    with rc1:
+        st.markdown("**RAW Layer**")
+        st.dataframe(raw_df.rename(columns={"TBL":"Table","CNT":"Records"}),
+                     use_container_width=True, hide_index=True)
+    with rc2:
+        st.markdown("**VALIDATED Layer**")
+        st.dataframe(val_df.rename(columns={"TBL":"Table","CNT":"Records"}),
+                     use_container_width=True, hide_index=True)
+
+# ── LOAD AUDIT LOG ────────────────────────────────────────────
+if show_audit:
+    st.markdown('<div class="section-title">📋 Load Audit Log</div>', unsafe_allow_html=True)
+    audit_df = run_query("""
+        SELECT table_name, load_time, records_loaded
+        FROM MEDICORE_DB.VALIDATED.LOAD_AUDIT_LOG
+        ORDER BY load_time DESC LIMIT 30
+    """)
+    if not audit_df.empty:
+        st.dataframe(
+            audit_df.rename(columns={
+                "TABLE_NAME":"Table","LOAD_TIME":"Load Time","RECORDS_LOADED":"Records"
+            }),
+            use_container_width=True, hide_index=True
+        )
+
+# ── FOOTER ────────────────────────────────────────────────────
+st.markdown("""
+<div style="margin-top:48px;padding:20px 0;border-top:1px solid #21262d;
+text-align:center;color:#6e7681;font-size:0.78rem;">
+  MediCore Hospital Operations Platform &nbsp;·&nbsp;
+  Snowflake Data Cloud &nbsp;·&nbsp;
+  RAW → VALIDATED → CURATED
+</div>
+""", unsafe_allow_html=True)
